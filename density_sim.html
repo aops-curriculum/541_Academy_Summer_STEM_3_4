@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Float or Sink? — Density &amp; Buoyancy</title>
+  <!-- Original AoPS interactive. Replaces the third-party "Density" simulation. -->
+<script>
+// EigenNode auto-height v2.4
+(function() {
+  // 4px buffer for subpixel rounding + parent's >=3px noise threshold.
+  // Extra 18px when horizontal overflow forces a scrollbar (eats vertical
+  // space inside the iframe — AoPS classroom embeds in a narrower column
+  // than the 600px content, so a horizontal scrollbar appears and steals
+  // ~10-17px of height). Without this, the iframe ends up ~11-15px short.
+  var BUFFER = 4;
+  var H_SCROLLBAR = 18;
+  var measuring = false;
+  function measure() {
+    if (measuring) return 0;
+    var b = document.body, h = document.documentElement;
+    if (!b) return 0;
+    measuring = true;
+    // Temporarily neutralise body's height/min-height (overriding stylesheet
+    // rules with !important) so scrollHeight reflects actual content extent.
+    // Without this, patterns like body { height: 100vh } cause scrollHeight
+    // to echo the iframe's current viewport — adding BUFFER each cycle
+    // ratchets the iframe taller forever. Browser doesn't paint until this
+    // synchronous block returns, so no visible flicker.
+    var hOld = b.style.height, hPri = b.style.getPropertyPriority('height');
+    var mOld = b.style.minHeight, mPri = b.style.getPropertyPriority('min-height');
+    b.style.setProperty('height', 'auto', 'important');
+    b.style.setProperty('min-height', '0', 'important');
+    var content = b.scrollHeight || 0;
+    if (hOld) b.style.setProperty('height', hOld, hPri); else b.style.removeProperty('height');
+    if (mOld) b.style.setProperty('min-height', mOld, mPri); else b.style.removeProperty('min-height');
+    measuring = false;
+    // Check the documentElement only — that's the element that owns the
+    // iframe's horizontal scrollbar. Body can be narrower than the iframe
+    // (e.g. body{width:600px} centered in a 700px iframe) and have its own
+    // 1-2px overflow that doesn't actually trigger a scrollbar.
+    var hOverflow = h && (h.scrollWidth - h.clientWidth) >= 4;
+    return Math.ceil(content) + BUFFER + (hOverflow ? H_SCROLLBAR : 0);
+  }
+  var last = 0;
+  function report() {
+    var h = measure();
+    if (h > 0 && Math.abs(h - last) >= 2) {
+      last = h;
+      window.parent.postMessage({ type: 'resize', height: h }, '*');
+    }
+  }
+  window.addEventListener('load', report);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(report);
+  if (window.ResizeObserver && document.body) new ResizeObserver(report).observe(document.body);
+})();
+</script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 700px; height: 500px; overflow: hidden;
+      background: #f5f5f5;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      user-select: none; -webkit-user-select: none;
+    }
+    canvas { display: block; touch-action: none; }
+    #bar {
+      width: 700px; height: 40px;
+      display: flex; align-items: center; gap: 18px;
+      padding: 0 14px; font-size: 13px; color: #334455;
+    }
+    #bar button {
+      font: 13px 'Segoe UI', system-ui, sans-serif;
+      padding: 4px 14px; border: 1px solid #b9c4ce; border-radius: 6px;
+      background: #ffffff; color: #334455; cursor: pointer;
+    }
+    #bar button:hover { background: #eef4fa; }
+    #bar label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    #bar .note { margin-left: auto; color: #8899aa; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <canvas id="c" width="700" height="460"></canvas>
+  <div id="bar">
+    <button id="reset" title="Restore the starting setup">&#8634; Reset</button>
+    <label><input type="checkbox" id="tableToggle"> Show density table</label>
+    <span class="note">water = 1000 kg/m&sup3;</span>
+  </div>
+  <script>
+  (() => {
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    const W = 700, H = 460;
+
+    // ── World scale & tank geometry ──────────────────────────
+    const S = 440;                         // pixels per meter
+    const TL = 26, TR = 422;               // tank inner left/right (px)
+    const TTOP = 64, TFLOOR = 414;         // tank rim top / inner floor (px)
+    const WALL = 8;                        // wall thickness (px)
+    const POOL_W_M   = (TR - TL) / S;      // 0.9 m inner width
+    const POOL_DEPTH = 0.20;               // into-screen depth (m)
+    const WATER0_M   = 0.52;               // initial water depth (m)
+    const SURF0 = TFLOOR - WATER0_M * S;   // initial surface y (px)
+
+    // ── Physics constants ────────────────────────────────────
+    const G = 9.81;                        // m/s^2
+    const RHO_W = 1000;                    // kg/m^3 (water)
+    const ZETA = 0.25;                     // damping ratio → gentle bobbing
+    const FULL_SUB_DRAG = 2.0;             // extra drag when fully submerged
+    const SUBDT = 1 / 240;                 // physics substep (s)
+
+    // ── Block catalog (density kg/m^3, volume liters) ────────
+    const CATALOG = {
+      foam:     { label: 'foam',     rho: 100,  volL: 3.0, base: '#f5f2dc', edge: '#c2bb93', text: '#857c4e', deco: 'pores'  },
+      wood:     { label: 'wood',     rho: 600,  volL: 2.0, base: '#c89b5f', edge: '#8a6233', text: '#4d3514', deco: 'grain'  },
+      ice:      { label: 'ice',      rho: 920,  volL: 2.0, base: '#d6eef8', edge: '#8fc3dd', text: '#2a6f8e', deco: 'shine'  },
+      brick:    { label: 'brick',    rho: 2000, volL: 1.5, base: '#b5503c', edge: '#7d3122', text: '#ffffff', deco: 'mortar' },
+      aluminum: { label: 'aluminum', rho: 2700, volL: 1.0, base: '#c9cdd4', edge: '#8e949e', text: '#3c424c', deco: 'sheen'  },
+      mystery:  { label: '?',        rho: 1200, volL: 2.0, base: '#a07bd6', edge: '#6c4d99', text: '#ffffff', deco: 'none', hideRho: true },
+    };
+    const ORDER = ['foam', 'wood', 'ice', 'brick', 'aluminum', 'mystery'];
+
+    // ── URL parameters: ?blocks=wood,brick&table=1 ───────────
+    const qs = new URLSearchParams(location.search);
+    const ALIAS = { aluminium: 'aluminum', alu: 'aluminum', '?': 'mystery', unknown: 'mystery' };
+    let names = (qs.get('blocks') || '').split(',')
+      .map(s => s.trim().toLowerCase()).map(s => ALIAS[s] || s)
+      .filter(s => CATALOG[s]);
+    names = [...new Set(names)];
+    if (!names.length) names = ORDER.slice();
+    const TABLE0 = qs.get('table') === '1';
+
+    // ── Blocks ───────────────────────────────────────────────
+    const blocks = names.map(nm => {
+      const c = CATALOG[nm];
+      const sideM = Math.cbrt(c.volL / 1000);     // cube side (m)
+      return Object.assign({}, c, {
+        nm, sideM,
+        sz: sideM * S,                            // side (px)
+        mass: c.rho * c.volL / 1000,              // kg
+        x: 0, y: 0, vy: 0,                        // center (px), vy px/s
+        state: 'shelf',                           // shelf | held | pool | return
+        home: { x: 0, y: 0 },
+      });
+    });
+
+    // Shelf layout: rows of 3 in the right column
+    const SHELF_X0 = 440, SHELF_X1 = 696, SHELF_YS = [222, 332];
+    [blocks.slice(0, 3), blocks.slice(3, 6)].forEach((row, ri) => {
+      if (!row.length) return;
+      const sumW = row.reduce((s, b) => s + b.sz, 0);
+      const gap = (SHELF_X1 - SHELF_X0 - sumW) / (row.length + 1);
+      let x = SHELF_X0 + gap;
+      for (const b of row) {
+        b.home.x = x + b.sz / 2;
+        b.home.y = SHELF_YS[ri] - b.sz / 2;
+        b.x = b.home.x; b.y = b.home.y;
+        x += b.sz + gap;
+      }
+    });
+
+    // ── State ────────────────────────────────────────────────
+    let waterSurf = SURF0;        // current surface y (px)
+    let held = null, lastHeld = null;
+    let grabDX = 0, grabDY = 0;
+    let tableOn = TABLE0;
+    let animT = 0;
+
+    const tableToggle = document.getElementById('tableToggle');
+    tableToggle.checked = TABLE0;
+    tableToggle.addEventListener('change', () => { tableOn = tableToggle.checked; });
+
+    document.getElementById('reset').addEventListener('click', () => {
+      for (const b of blocks) {
+        b.state = 'shelf'; b.x = b.home.x; b.y = b.home.y; b.vy = 0;
+      }
+      waterSurf = SURF0; held = null; lastHeld = null;
+      tableOn = TABLE0; tableToggle.checked = TABLE0;
+    });
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+    // ── Physics helpers ──────────────────────────────────────
+    // Submerged height of a block (px), against the flat physics surface.
+    const subPx = b => clamp(b.y + b.sz / 2 - waterSurf, 0, b.sz);
+
+    // Total displaced volume (m^3) of blocks in/over the pool.
+    function displacedM3() {
+      let v = 0;
+      for (const b of blocks) {
+        if (b.state !== 'pool' && b.state !== 'held') continue;
+        if (b.state === 'held' && (b.x < TL || b.x > TR)) continue;
+        v += b.sideM * b.sideM * (subPx(b) / S);
+      }
+      return v;
+    }
+
+    // One physics substep for free blocks in the pool.
+    function physStep(h) {
+      for (const b of blocks) {
+        if (b.state !== 'pool') continue;
+        const frac = subPx(b) / b.sz;            // submerged fraction 0..1
+        // Acceleration from gravity + buoyancy (depends only on ratios):
+        const a = G * (1 - (RHO_W / b.rho) * frac);   // m/s^2
+        let damp;                                 // linear drag rate (1/s)
+        if (frac <= 0) {
+          damp = 0.1;                             // light air drag
+        } else {
+          const om = Math.sqrt(G * RHO_W / (b.rho * b.sideM)); // bob freq (rad/s)
+          damp = 2 * ZETA * om * (frac >= 1 ? FULL_SUB_DRAG : 1);
+        }
+        b.vy += (a * S - damp * b.vy) * h;        // semi-implicit Euler (px/s)
+        b.y  += b.vy * h;
+        // Rest on the bottom
+        if (b.y + b.sz / 2 >= TFLOOR) {
+          b.y = TFLOOR - b.sz / 2;
+          if (b.vy > 0) b.vy = 0;
+        }
+        b.x = clamp(b.x, TL + b.sz / 2, TR - b.sz / 2);
+      }
+    }
+
+    // Gentle horizontal push-apart so pool blocks don't interpenetrate.
+    function separate() {
+      for (let i = 0; i < blocks.length; i++) {
+        const a = blocks[i];
+        if (a.state !== 'pool') continue;
+        for (let j = i + 1; j < blocks.length; j++) {
+          const b = blocks[j];
+          if (b.state !== 'pool') continue;
+          const hw = (a.sz + b.sz) / 2;
+          const dx = a.x - b.x, dy = a.y - b.y;
+          const px = hw - Math.abs(dx), py = hw - Math.abs(dy);
+          if (px > 0 && py > 0) {
+            const dir = dx !== 0 ? Math.sign(dx) : -1;
+            const push = px * 0.35 / 2;
+            a.x = clamp(a.x + dir * push, TL + a.sz / 2, TR - a.sz / 2);
+            b.x = clamp(b.x - dir * push, TL + b.sz / 2, TR - b.sz / 2);
+          }
+        }
+      }
+    }
+
+    // ── Drawing helpers ──────────────────────────────────────
+    function roundRect(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+    const hash = k => {
+      const v = Math.sin(k * 12.9898) * 43758.5453;
+      return v - Math.floor(v);
+    };
+
+    function drawBlock(b, hl) {
+      const s = b.sz, x = b.x - s / 2, y = b.y - s / 2;
+      ctx.save();
+      if (b.nm === 'ice') ctx.globalAlpha = 0.92;
+      if (hl) { ctx.shadowColor = 'rgba(0,0,0,0.35)'; ctx.shadowBlur = 10; ctx.shadowOffsetY = 3; }
+      roundRect(x, y, s, s, 3);
+      ctx.fillStyle = b.base; ctx.fill();
+      ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+
+      // top sheen
+      roundRect(x, y, s, s * 0.42, 3);
+      ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fill();
+
+      // material decoration (clipped to the block)
+      ctx.save();
+      roundRect(x, y, s, s, 3); ctx.clip();
+      if (b.deco === 'grain') {
+        ctx.strokeStyle = 'rgba(90,55,20,0.30)'; ctx.lineWidth = 1.2;
+        for (let i = 1; i <= 3; i++) {
+          const gy = y + s * i / 4;
+          ctx.beginPath();
+          ctx.moveTo(x, gy);
+          ctx.quadraticCurveTo(x + s / 2, gy + (i % 2 ? 3 : -3), x + s, gy);
+          ctx.stroke();
+        }
+      } else if (b.deco === 'mortar') {
+        ctx.strokeStyle = 'rgba(245,232,222,0.55)'; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x, y + s / 3); ctx.lineTo(x + s, y + s / 3);
+        ctx.moveTo(x, y + 2 * s / 3); ctx.lineTo(x + s, y + 2 * s / 3);
+        ctx.moveTo(x + s / 2, y); ctx.lineTo(x + s / 2, y + s / 3);
+        ctx.moveTo(x + s / 4, y + s / 3); ctx.lineTo(x + s / 4, y + 2 * s / 3);
+        ctx.moveTo(x + 3 * s / 4, y + s / 3); ctx.lineTo(x + 3 * s / 4, y + 2 * s / 3);
+        ctx.moveTo(x + s / 2, y + 2 * s / 3); ctx.lineTo(x + s / 2, y + s);
+        ctx.stroke();
+      } else if (b.deco === 'pores') {
+        ctx.fillStyle = 'rgba(160,150,110,0.35)';
+        for (let k = 1; k <= 14; k++) {
+          const u = hash(k), v = hash(k + 57);
+          ctx.beginPath();
+          ctx.arc(x + 4 + u * (s - 8), y + 4 + v * (s - 8), 1.3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } else if (b.deco === 'sheen') {
+        const g = ctx.createLinearGradient(x, y, x + s, y + s);
+        g.addColorStop(0.40, 'rgba(255,255,255,0)');
+        g.addColorStop(0.50, 'rgba(255,255,255,0.45)');
+        g.addColorStop(0.60, 'rgba(255,255,255,0)');
+        ctx.fillStyle = g; ctx.fillRect(x, y, s, s);
+      } else if (b.deco === 'shine') {
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x + s * 0.20, y + s * 0.58); ctx.lineTo(x + s * 0.48, y + s * 0.22);
+        ctx.moveTo(x + s * 0.42, y + s * 0.72); ctx.lineTo(x + s * 0.62, y + s * 0.46);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      roundRect(x, y, s, s, 3);
+      ctx.strokeStyle = b.edge; ctx.lineWidth = hl ? 2.2 : 1.5; ctx.stroke();
+
+      // label (shrink to fit)
+      let fs = b.nm === 'mystery' ? s * 0.48 : 12;
+      ctx.font = `bold ${fs}px 'Segoe UI', system-ui, sans-serif`;
+      while (fs > 7 && ctx.measureText(b.label).width > s - 8) {
+        fs -= 0.5;
+        ctx.font = `bold ${fs}px 'Segoe UI', system-ui, sans-serif`;
+      }
+      ctx.fillStyle = b.text;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(b.label, b.x, b.y + 1);
+      ctx.textBaseline = 'alphabetic';
+      ctx.restore();
+    }
+
+    function drawTank() {
+      // interior backdrop
+      ctx.fillStyle = '#edf3f7';
+      ctx.fillRect(TL, TTOP, TR - TL, TFLOOR - TTOP);
+      // depth ticks on the left inner wall (every 0.05 m, big each 0.1 m)
+      ctx.strokeStyle = 'rgba(80,110,140,0.35)'; ctx.lineWidth = 1;
+      for (let d = 0.05; d <= 0.75; d += 0.05) {
+        const y = TFLOOR - d * S;
+        if (y < TTOP + 4) break;
+        const len = (Math.round(d * 100) % 10 === 0) ? 10 : 5;
+        ctx.beginPath(); ctx.moveTo(TL, y); ctx.lineTo(TL + len, y); ctx.stroke();
+      }
+    }
+
+    function drawWater(t) {
+      const amp = 1.3, k = 2 * Math.PI / 70, ph = 1.6 * t;
+      // filled water body with a gently waving top edge (visual only)
+      ctx.beginPath();
+      ctx.moveTo(TL, waterSurf + amp * Math.sin(k * TL - ph));
+      for (let x = TL + 4; x <= TR; x += 4) {
+        ctx.lineTo(x, waterSurf + amp * Math.sin(k * x - ph));
+      }
+      ctx.lineTo(TR, TFLOOR); ctx.lineTo(TL, TFLOOR); ctx.closePath();
+      const g = ctx.createLinearGradient(0, waterSurf, 0, TFLOOR);
+      g.addColorStop(0, 'rgba(80,160,225,0.25)');
+      g.addColorStop(1, 'rgba(40,100,180,0.45)');
+      ctx.fillStyle = g; ctx.fill();
+      // surface line
+      ctx.beginPath();
+      ctx.moveTo(TL, waterSurf + amp * Math.sin(k * TL - ph));
+      for (let x = TL + 4; x <= TR; x += 4) {
+        ctx.lineTo(x, waterSurf + amp * Math.sin(k * x - ph));
+      }
+      ctx.strokeStyle = 'rgba(30,90,160,0.6)'; ctx.lineWidth = 2; ctx.stroke();
+      // start-level reference
+      ctx.save();
+      ctx.setLineDash([5, 4]);
+      ctx.strokeStyle = 'rgba(0,70,140,0.40)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(TL, SURF0); ctx.lineTo(TR, SURF0); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(0,70,140,0.55)';
+      ctx.font = '9px Segoe UI'; ctx.textAlign = 'right';
+      ctx.fillText('start level', TR - 5, SURF0 + 10);
+      ctx.restore();
+      // faint label
+      ctx.fillStyle = 'rgba(20,70,130,0.30)';
+      ctx.font = 'italic 12px Segoe UI'; ctx.textAlign = 'left';
+      ctx.fillText('water', TL + 8, waterSurf + 18);
+    }
+
+    function drawWalls() {
+      ctx.fillStyle = '#aab6c0';
+      ctx.fillRect(TL - WALL, TTOP, WALL, TFLOOR - TTOP + WALL);       // left
+      ctx.fillRect(TR, TTOP, WALL, TFLOOR - TTOP + WALL);              // right
+      ctx.fillRect(TL - WALL, TFLOOR, TR - TL + 2 * WALL, WALL);       // floor
+      ctx.strokeStyle = 'rgba(0,0,0,0.18)'; ctx.lineWidth = 1;
+      ctx.strokeRect(TL - WALL, TTOP, WALL, TFLOOR - TTOP + WALL);
+      ctx.strokeRect(TR, TTOP, WALL, TFLOOR - TTOP + WALL);
+      ctx.strokeRect(TL - WALL, TFLOOR, TR - TL + 2 * WALL, WALL);
+    }
+
+    function drawShelves() {
+      const rows = blocks.length > 3 ? 2 : 1;
+      ctx.fillStyle = '#b59b7a';
+      ctx.strokeStyle = '#8a704e'; ctx.lineWidth = 1;
+      for (let i = 0; i < rows; i++) {
+        ctx.fillRect(SHELF_X0 - 6, SHELF_YS[i], SHELF_X1 - SHELF_X0 + 12, 6);
+        ctx.strokeRect(SHELF_X0 - 6, SHELF_YS[i], SHELF_X1 - SHELF_X0 + 12, 6);
+      }
+    }
+
+    function drawReadout() {
+      const X = 440, Y = 12, PW = 256, PH = 118;
+      roundRect(X, Y, PW, PH, 8);
+      ctx.fillStyle = '#ffffff'; ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.lineWidth = 1; ctx.stroke();
+      const shown = held || lastHeld;
+      if (!shown) {
+        ctx.fillStyle = '#9aabbc'; ctx.font = '12px Segoe UI'; ctx.textAlign = 'center';
+        ctx.fillText('Pick up a block to see its', X + PW / 2, Y + 48);
+        ctx.fillText('mass, volume, and density.', X + PW / 2, Y + 66);
+      } else {
+        // swatch + name
+        roundRect(X + 14, Y + 12, 16, 16, 3);
+        ctx.fillStyle = shown.base; ctx.fill();
+        ctx.strokeStyle = shown.edge; ctx.lineWidth = 1.2; ctx.stroke();
+        ctx.fillStyle = '#334455';
+        ctx.font = 'bold 14px Segoe UI'; ctx.textAlign = 'left';
+        const nm = shown.nm === 'mystery' ? 'mystery block' : shown.label;
+        ctx.fillText(nm, X + 38, Y + 25);
+        if (!held) {
+          const nmW = ctx.measureText(nm).width;
+          ctx.fillStyle = '#9aabbc'; ctx.font = '10px Segoe UI';
+          ctx.fillText('(last held)', X + 38 + nmW + 8, Y + 25);
+        }
+        ctx.font = '13px Segoe UI'; ctx.fillStyle = '#334455';
+        ctx.fillText('Mass:', X + 14, Y + 50);
+        ctx.fillText('Volume:', X + 14, Y + 70);
+        ctx.fillText('Density:', X + 14, Y + 90);
+        ctx.textAlign = 'right'; ctx.font = 'bold 13px Segoe UI';
+        ctx.fillText(shown.mass.toFixed(2) + ' kg', X + PW - 14, Y + 50);
+        ctx.fillText(shown.volL.toFixed(1) + ' L', X + PW - 14, Y + 70);
+        if (shown.hideRho) {
+          ctx.fillStyle = '#9a6bd0';
+          ctx.fillText('?', X + PW - 14, Y + 90);
+          ctx.fillStyle = '#9aabbc'; ctx.font = 'italic 10px Segoe UI';
+          ctx.fillText('try mass ÷ volume!', X + PW - 14, Y + 103);
+        } else {
+          ctx.fillText(Math.round(shown.rho) + ' kg/m³', X + PW - 14, Y + 90);
+          ctx.fillStyle = '#9aabbc'; ctx.font = '10px Segoe UI';
+          ctx.fillText('= ' + (shown.rho / 1000).toFixed(2) + ' kg per liter',
+                       X + PW - 14, Y + 103);
+        }
+      }
+      ctx.fillStyle = '#b6c2cd'; ctx.font = 'italic 10px Segoe UI';
+      ctx.textAlign = 'left';
+      ctx.fillText('density = mass ÷ volume', X + 14, Y + PH - 8);
+    }
+
+    function drawTable() {
+      // rows: known blocks ascending by density, water inserted in order,
+      // mystery last (so its place in the ordering is not given away)
+      const known = blocks.filter(b => !b.hideRho).slice().sort((a, b) => a.rho - b.rho);
+      const myst = blocks.filter(b => b.hideRho);
+      const rows = [];
+      let waterIn = false;
+      for (const b of known) {
+        if (!waterIn && b.rho > RHO_W) { rows.push('water'); waterIn = true; }
+        rows.push(b);
+      }
+      if (!waterIn) rows.push('water');
+      for (const b of myst) rows.push(b);
+
+      const X = 440, Y = 140, PW = 256;
+      const PH = 50 + rows.length * 26 + 20;
+      ctx.save();
+      ctx.globalAlpha = 0.97;
+      roundRect(X, Y, PW, PH, 8);
+      ctx.fillStyle = '#ffffff'; ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.18)'; ctx.lineWidth = 1; ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#334455'; ctx.font = 'bold 13px Segoe UI'; ctx.textAlign = 'left';
+      ctx.fillText('Density table (kg/m³)', X + 14, Y + 24);
+      ctx.strokeStyle = 'rgba(0,0,0,0.10)';
+      ctx.beginPath(); ctx.moveTo(X + 10, Y + 34); ctx.lineTo(X + PW - 10, Y + 34); ctx.stroke();
+
+      let ry = Y + 44;
+      for (const r of rows) {
+        const water = r === 'water';
+        if (water) {
+          ctx.fillStyle = 'rgba(90,167,224,0.16)';
+          ctx.fillRect(X + 6, ry - 4, PW - 12, 24);
+        }
+        // swatch
+        roundRect(X + 14, ry, 14, 14, 3);
+        ctx.fillStyle = water ? '#5aa7e0' : r.base; ctx.fill();
+        ctx.strokeStyle = water ? '#3a7cb0' : r.edge; ctx.lineWidth = 1; ctx.stroke();
+        // name
+        ctx.fillStyle = '#334455'; ctx.font = '13px Segoe UI'; ctx.textAlign = 'left';
+        ctx.fillText(water ? 'water' : (r.nm === 'mystery' ? '? mystery' : r.label),
+                     X + 36, ry + 12);
+        // density
+        ctx.textAlign = 'right'; ctx.font = 'bold 13px Segoe UI';
+        if (water) {
+          ctx.fillText('1000', X + PW - 16, ry + 12);
+        } else if (r.hideRho) {
+          ctx.fillStyle = '#9a6bd0';
+          ctx.fillText('?', X + PW - 16, ry + 12);
+        } else {
+          ctx.fillText(String(r.rho), X + PW - 16, ry + 12);
+        }
+        ry += 26;
+      }
+      ctx.fillStyle = '#9aabbc'; ctx.font = 'italic 10px Segoe UI'; ctx.textAlign = 'left';
+      ctx.fillText('less dense than water → floats', X + 14, Y + PH - 10);
+      ctx.restore();
+    }
+
+    // ── Main draw ────────────────────────────────────────────
+    function draw(t) {
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = '#f5f5f5'; ctx.fillRect(0, 0, W, H);
+
+      drawTank();
+      drawShelves();
+
+      // hint
+      ctx.fillStyle = '#9ab0c4'; ctx.font = '12px Segoe UI'; ctx.textAlign = 'center';
+      ctx.fillText('Drag a block into the water ↓', (TL + TR) / 2, 46);
+
+      // blocks (held drawn last so it sits on top)
+      for (const b of blocks) if (b !== held) drawBlock(b, false);
+      if (held) drawBlock(held, true);
+
+      drawWater(t);
+      drawWalls();
+      drawReadout();
+      if (tableOn) drawTable();
+    }
+
+    // ── Animation loop ───────────────────────────────────────
+    let lastTs = null;
+    function frame(ts) {
+      if (lastTs === null) lastTs = ts;
+      const dt = Math.min((ts - lastTs) / 1000, 0.05);
+      lastTs = ts; animT += dt;
+
+      // physics in fixed substeps
+      const n = Math.max(1, Math.round(dt / SUBDT));
+      const h = dt / n;
+      for (let i = 0; i < n; i++) physStep(h);
+      separate();
+
+      // water level eases toward displaced-volume target
+      const target = TFLOOR - (WATER0_M + displacedM3() / (POOL_W_M * POOL_DEPTH)) * S;
+      waterSurf += (target - waterSurf) * Math.min(1, 5 * dt);
+
+      // return-to-shelf animation
+      for (const b of blocks) {
+        if (b.state !== 'return') continue;
+        const dx = b.home.x - b.x, dy = b.home.y - b.y;
+        const d = Math.hypot(dx, dy), step = 1400 * dt;
+        if (d <= step) { b.x = b.home.x; b.y = b.home.y; b.state = 'shelf'; }
+        else { b.x += dx / d * step; b.y += dy / d * step; }
+      }
+
+      draw(animT);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    // ── Interaction (pointer events: mouse + touch) ──────────
+    const cpos = e => {
+      const r = canvas.getBoundingClientRect();
+      return [e.clientX - r.left, e.clientY - r.top];
+    };
+
+    function pickAt(mx, my) {
+      let p = null;
+      for (const b of blocks) {              // last match = topmost drawn
+        if (b.state === 'return') continue;
+        if (b.state === 'shelf' && tableOn) continue;  // shelf hidden by table
+        if (Math.abs(mx - b.x) <= b.sz / 2 + 1 && Math.abs(my - b.y) <= b.sz / 2 + 1) p = b;
+      }
+      return p;
+    }
+
+    canvas.addEventListener('pointerdown', e => {
+      const [mx, my] = cpos(e);
+      const b = pickAt(mx, my);
+      if (!b) return;
+      held = b; lastHeld = b;
+      b.state = 'held'; b.vy = 0;
+      grabDX = mx - b.x; grabDY = my - b.y;
+      canvas.setPointerCapture(e.pointerId);
+      canvas.style.cursor = 'grabbing';
+    });
+
+    canvas.addEventListener('pointermove', e => {
+      const [mx, my] = cpos(e);
+      if (held) {
+        held.x = clamp(mx - grabDX, held.sz / 2 + 2, W - held.sz / 2 - 2);
+        held.y = clamp(my - grabDY, held.sz / 2 + 2, H - held.sz / 2 - 2);
+        // can't push a block through the tank floor
+        if (held.x > TL - held.sz / 2 && held.x < TR + held.sz / 2) {
+          held.y = Math.min(held.y, TFLOOR - held.sz / 2);
+        }
+      } else {
+        canvas.style.cursor = pickAt(mx, my) ? 'grab' : 'default';
+      }
+    });
+
+    function release() {
+      if (!held) return;
+      const b = held; held = null;
+      if (b.x > TL && b.x < TR && b.y < TFLOOR) {
+        b.state = 'pool';
+        b.x = clamp(b.x, TL + b.sz / 2, TR - b.sz / 2);
+        b.vy = 0;
+      } else {
+        b.state = 'return';
+      }
+      canvas.style.cursor = 'default';
+    }
+    canvas.addEventListener('pointerup', release);
+    canvas.addEventListener('pointercancel', release);
+
+  })();
+  </script>
+</body>
+</html>
